@@ -1,10 +1,7 @@
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.experimental import enable_iterative_imputer
-from sklearn.impute import IterativeImputer
-from sklearn.pipeline import Pipeline
+import numpy as np
+import xgboost as xgb
 from sklearn.model_selection import train_test_split
-import joblib
 import os
 
 def train_rf(data_path, target_col, model_save_path):
@@ -19,6 +16,10 @@ def train_rf(data_path, target_col, model_save_path):
     X = df.drop(columns=['RecordID'] + target_cols, errors='ignore')
     y = df[target_col]
     
+    # Robust floating point handling
+    X = X.replace([np.inf, -np.inf], np.nan)
+    X = X.astype(np.float32)
+    
     # Apply Outlier Clipping (Temp < 30 -> 30)
     for col in X.columns:
         if 'Temp' in col:
@@ -26,40 +27,62 @@ def train_rf(data_path, target_col, model_save_path):
             
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     
-    print(f"Training Balanced Random Forest Classifier with Iterative Imputation for {target_col}...")
-    # Using IterativeImputer with a tree estimator to prevent overflow from extreme collinearity
-    from sklearn.tree import DecisionTreeRegressor
-    pipeline = Pipeline([
-        ('imputer', IterativeImputer(estimator=DecisionTreeRegressor(max_depth=5, random_state=42), max_iter=5, random_state=42)),
-        ('rf', RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42, n_jobs=-1, class_weight='balanced'))
-    ])
+    # Calculate scale_pos_weight for class imbalance
+    pos_count = y_train.sum()
+    scale_pos_weight = (len(y_train) - pos_count) / pos_count if pos_count > 0 else 1.0
     
-    pipeline.fit(X_train, y_train)
+    print(f"Training Balanced XGBoost Random Forest Classifier for {target_col}...")
     
-    accuracy = pipeline.score(X_test, y_test)
+    try:
+        model = xgb.XGBRFClassifier(
+            n_estimators=100, 
+            max_depth=10, 
+            random_state=42, 
+            scale_pos_weight=scale_pos_weight,
+            eval_metric='logloss',
+            tree_method='hist',
+            device='cuda'
+        )
+        model.fit(X_train, y_train)
+        print("Successfully trained using GPU.")
+    except Exception as e:
+        print(f"GPU training failed: {e}\nFalling back to CPU...")
+        model = xgb.XGBRFClassifier(
+            n_estimators=100, 
+            max_depth=10, 
+            random_state=42, 
+            scale_pos_weight=scale_pos_weight,
+            eval_metric='logloss',
+            tree_method='hist',
+            device='cpu'
+        )
+        model.fit(X_train, y_train)
+    
+    accuracy = model.score(X_test, y_test)
     print(f"Test Accuracy: {accuracy:.4f}")
     
     os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
     
-    # Save using joblib. Since this is a scikit-learn pipeline, 
-    # it must be loaded in R using the `reticulate` library.
-    joblib.dump(pipeline, model_save_path)
-    print(f"Random Forest pipeline saved to {model_save_path}\n")
+    # Save as JSON. This is the universally supported format for XGBoost models across
+    # Python, R, and other bindings without generating UBJSON fallback warnings.
+    model.save_model(model_save_path)
+    print(f"Random Forest model saved to {model_save_path}\n")
 
 if __name__ == '__main__':
-    data_dir = r'd:\Repositories\Thesis\preprocessing\processed_datasets'
-    out_dir = r'd:\Repositories\Thesis\preprocessing\trained_models'
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(base_dir, 'processed_datasets')
+    out_dir = os.path.join(base_dir, 'trained_models')
     
     # 1. Mortality (Early Prediction)
     train_rf(
         os.path.join(data_dir, 'mortality_early_prediction.csv'),
         'target_In-hospital_death',
-        os.path.join(out_dir, 'rf_mortality.pkl')
+        os.path.join(out_dir, 'rf_mortality.json')
     )
     
     # 2. Sepsis (Early Prediction)
     train_rf(
         os.path.join(data_dir, 'sepsis_early_prediction.csv'),
         'target_SepsisLabel',
-        os.path.join(out_dir, 'rf_sepsis.pkl')
+        os.path.join(out_dir, 'rf_sepsis.json')
     )

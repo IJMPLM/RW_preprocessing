@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 from statsmodels.tsa.arima.model import ARIMA
 import joblib
 import os
@@ -17,6 +18,12 @@ def train_arima_demo(data_path, model_save_path):
     patient_id = record_counts.index[0]
     patient_df = df[df['RecordID'] == patient_id].sort_values('Hour_Bin')
     
+    # Robust floating point handling
+    patient_df = patient_df.replace([np.inf, -np.inf], np.nan)
+    for col in patient_df.columns:
+        if patient_df[col].dtype == 'float64':
+            patient_df[col] = patient_df[col].astype(np.float32)
+
     # Apply Outlier Clipping (Temp < 30 -> 30)
     for col in patient_df.columns:
         if 'Temp' in col:
@@ -30,7 +37,7 @@ def train_arima_demo(data_path, model_save_path):
     
     # Basic ARIMA(1,0,1) model
     model = ARIMA(endog=target_series, exog=exog_series, order=(1, 0, 1))
-    fitted_model = model.fit()
+    fitted_model = model.fit(method_kwargs={'maxiter': 200})
     
     print(f"Model Fit AIC: {fitted_model.aic:.2f}")
     
@@ -38,15 +45,16 @@ def train_arima_demo(data_path, model_save_path):
     
     # Save the statsmodels object.
     # IMPORTANT: Loading this in R requires `reticulate`. 
-    # However, if your SHAP variants are heavily reliant on R objects, it is HIGHLY recommended 
-    # to fit ARIMA models directly in R using `forecast::auto.arima` instead of passing
-    # Python statsmodels objects across the language barrier.
+    # Statsmodels objects do not have a native cross-language binary format (like safetensors).
+    # Exporting as JSON would only provide parts/coefficients, requiring manual rebuild in R.
+    # Thus, this is saved as a complete pickled model object to preserve native prediction capabilities.
     joblib.dump(fitted_model, model_save_path)
     print(f"ARIMA model saved to {model_save_path}\n")
 
 if __name__ == '__main__':
-    data_dir = r'd:\Repositories\Thesis\preprocessing\processed_datasets'
-    out_dir = r'd:\Repositories\Thesis\preprocessing\trained_models'
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(base_dir, 'processed_datasets')
+    out_dir = os.path.join(base_dir, 'trained_models')
     
     # 1. Mortality (Sequential)
     train_arima_demo(
